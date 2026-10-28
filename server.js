@@ -382,10 +382,14 @@ function deleteOrder(req, res) {
 
 // Universal proxy for provider actions such as balance, services, status, and add.
 async function handleProxyRequest(req, res) {
+  let action = null;
+  let timeoutMs = 15000;
+  let provider = 'panel';
+
   try {
     const targetUrl = req.body.baseUrl || req.body.url || req.body.apiUrl || req.body.api_url || req.body.params?.baseUrl || req.body.params?.apiUrl;
     const apiKey = req.body.apiKey || req.body.key || req.body.api_key || req.body.params?.key || req.body.params?.apiKey;
-    const action = req.body.action || req.body.params?.action || req.body.data?.action;
+    action = req.body.action || req.body.params?.action || req.body.data?.action || null;
 
     const extraData = {
       ...(req.body.params || {}),
@@ -399,7 +403,13 @@ async function handleProxyRequest(req, res) {
     if (!targetUrl) return res.status(400).json({ error: 'Target URL is required' });
     if (!apiKey) return res.status(400).json({ error: 'API Key is required' });
 
-    const data = await postSmmApi(safeUrl(targetUrl, 'Panel API URL'), apiKey, {
+    const validatedTargetUrl = safeUrl(targetUrl, 'Panel API URL');
+    const parsedTarget = new URL(validatedTargetUrl);
+    const isOrganicEndpoint = /\/functions\/v1\/public-api\/?$/i.test(parsedTarget.pathname);
+    provider = isOrganicEndpoint ? 'organic-smm' : 'panel';
+    timeoutMs = isOrganicEndpoint ? 30000 : 15000;
+
+    const data = await postSmmApi(validatedTargetUrl, apiKey, {
       ...(action ? { action } : {}),
       ...extraData
     });
@@ -408,10 +418,19 @@ async function handleProxyRequest(req, res) {
     if (Array.isArray(data) && !isServicesAction) return res.json({ orders: data });
     return res.json(data);
   } catch (error) {
-    console.error('Proxy Error:', error.response?.data || error.message);
-    return res.status(error.statusCode || error.response?.status || 500).json({
-      error: error.message || 'Proxy request failed',
-      details: error.response?.data || null
+    const isTimeout = error.code === 'ECONNABORTED' || /timeout of \d+ms exceeded/i.test(error.message || '');
+    const errorMessage = isTimeout
+      ? `Provider API did not respond within ${timeoutMs}ms`
+      : (error.message || 'Proxy request failed');
+
+    console.error('Proxy Error:', isTimeout ? `Upstream timeout during action ${action || 'unknown'} (${provider})` : (error.response?.data || error.message));
+    return res.status(error.statusCode || error.response?.status || (isTimeout ? 504 : 500)).json({
+      error: errorMessage,
+      code: isTimeout ? 'UPSTREAM_TIMEOUT' : (error.code || 'PROXY_ERROR'),
+      action,
+      provider,
+      timeoutMs,
+      details: isTimeout ? null : (error.response?.data || null)
     });
   }
 }
