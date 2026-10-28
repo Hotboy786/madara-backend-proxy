@@ -13,11 +13,12 @@ app.get('/', (req, res) => {
   res.send('Madara Proxy Server is Running');
 });
 
+// Universal Proxy Handler
 async function handleProxyRequest(req, res) {
   try {
     const targetUrl = req.body.baseUrl || req.body.url || req.body.apiUrl || req.body.api_url;
     const apiKey = req.body.apiKey || req.body.key || req.body.api_key || req.body.params?.key;
-
+    
     let action = req.body.action || req.body.params?.action;
     if (!action && req.path.includes('schedule')) action = 'add';
 
@@ -33,7 +34,11 @@ async function handleProxyRequest(req, res) {
     delete extraData.baseUrl;
     delete extraData.url;
 
+    // Handle initial state requests for orders / logs / schedules when no target URL is provided yet
     if (!targetUrl) {
+      if (req.path.includes('orders') || req.path.includes('schedule')) {
+        return res.json({ orders: [], entries: [], status: "success" });
+      }
       return res.status(400).json({ error: 'Target URL is required' });
     }
 
@@ -58,17 +63,27 @@ async function handleProxyRequest(req, res) {
       timeout: 15000
     });
 
-    return res.json(response.data);
+    // Ensure array fields exist in response if UI expects them
+    let resData = response.data;
+    if (typeof resData === 'object' && resData !== null) {
+      if (resData.orders === undefined && Array.isArray(resData)) resData = { orders: resData };
+    }
+
+    return res.json(resData);
 
   } catch (error) {
     console.error('Proxy Error:', error.response?.data || error.message);
-    return res.status(error.response?.status || 500).json({
-      error: error.message,
-      details: error.response?.data || null
+    
+    // Fallback empty structures on error so frontend map functions don't crash
+    return res.status(200).json({
+      orders: [],
+      entries: [],
+      error: error.message
     });
   }
 }
 
+// Map all endpoints to universal handler
 app.all('/proxy', handleProxyRequest);
 app.all('/schedule-order', handleProxyRequest);
 app.all('/orders', handleProxyRequest);
