@@ -41,20 +41,27 @@ function safeUrl(value, label) {
 }
 
 async function postSmmApi(targetUrl, apiKey, params) {
+  const parsedTarget = new URL(targetUrl);
+  // Organic SMM's documented endpoint accepts JSON with a "key" field.
+  // Keep form-encoded requests unchanged for standard SMM-panel APIs.
+  const usesOrganicJsonApi = /\/functions\/v1\/public-api\/?$/i.test(parsedTarget.pathname);
+  const requestData = { key: apiKey, ...params };
   const response = await axios({
     method: 'POST',
     url: targetUrl,
-    data: qs.stringify({ key: apiKey, ...params }),
+    data: usesOrganicJsonApi ? requestData : qs.stringify(requestData),
     headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Type': usesOrganicJsonApi ? 'application/json' : 'application/x-www-form-urlencoded',
       'User-Agent': 'Madara-Panel-Proxy/1.0'
     },
-    timeout: 15000
+    // Organic SMM previously timed out at the proxy's 15-second limit.
+    timeout: usesOrganicJsonApi ? 30000 : 15000
   });
 
   const data = response.data;
-  if (data && typeof data === 'object' && data.error) {
-    const error = new Error(String(data.error));
+  const providerStatus = data && typeof data.status === 'string' ? data.status.toLowerCase() : '';
+  if (data && typeof data === 'object' && (data.error || providerStatus === 'error')) {
+    const error = new Error(String(data.error || data.message || data.msg || 'Provider API returned an error'));
     error.statusCode = 400;
     throw error;
   }
