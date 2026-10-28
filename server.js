@@ -16,11 +16,11 @@ app.get('/', (req, res) => {
 // Universal Proxy Handler
 async function handleProxyRequest(req, res) {
   try {
-    const targetUrl = req.body.baseUrl || req.body.url || req.body.apiUrl || req.body.api_url;
-    const apiKey = req.body.apiKey || req.body.key || req.body.api_key || req.body.params?.key;
+    const targetUrl = req.body.baseUrl || req.body.url || req.body.apiUrl || req.body.api_url || req.body.params?.baseUrl || req.body.params?.apiUrl;
+    const apiKey = req.body.apiKey || req.body.key || req.body.api_key || req.body.params?.key || req.body.params?.apiKey;
     
-    let action = req.body.action || req.body.params?.action;
-    if (!action && req.path.includes('schedule')) action = 'add';
+    // Extract exact action requested by frontend (balance, services, add, status, etc.)
+    let action = req.body.action || req.body.params?.action || req.body.data?.action;
 
     const extraData = {
       ...(req.body.params || {}),
@@ -33,16 +33,21 @@ async function handleProxyRequest(req, res) {
     delete extraData.action;
     delete extraData.baseUrl;
     delete extraData.url;
+    delete extraData.apiUrl;
 
-    // FIX: If frontend queries internal orders/logs without a targetUrl, return empty arrays immediately
+    // Return empty arrays for internal UI table queries missing a targetUrl
     if (!targetUrl) {
-      return res.json([]);
+      if (req.path.includes('orders') || req.path.includes('schedule') || req.path.includes('log')) {
+        return res.json([]);
+      }
+      return res.status(400).json({ error: 'Target URL is required' });
     }
 
     if (!apiKey) {
-      return res.json([]);
+      return res.status(400).json({ error: 'API Key is required' });
     }
 
+    // Build form-urlencoded payload for standard SMM API
     const payload = {
       key: apiKey,
       ...(action ? { action } : {}),
@@ -61,8 +66,12 @@ async function handleProxyRequest(req, res) {
     });
 
     let resData = response.data;
+
+    // Normalize response for frontend maps
     if (typeof resData === 'object' && resData !== null) {
-      if (resData.orders === undefined && Array.isArray(resData)) resData = { orders: resData };
+      if (resData.orders === undefined && Array.isArray(resData)) {
+        resData = { orders: resData };
+      }
     }
 
     return res.json(resData);
@@ -70,8 +79,15 @@ async function handleProxyRequest(req, res) {
   } catch (error) {
     console.error('Proxy Error:', error.response?.data || error.message);
     
-    // Always return array-friendly fallbacks on error
-    return res.status(200).json([]);
+    // Prevent UI map crashes on failure
+    if (req.path.includes('orders') || req.path.includes('schedule') || req.path.includes('log')) {
+      return res.status(200).json([]);
+    }
+    
+    return res.status(error.response?.status || 500).json({
+      error: error.message,
+      details: error.response?.data || null
+    });
   }
 }
 
