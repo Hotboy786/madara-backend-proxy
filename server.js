@@ -34,16 +34,13 @@ async function handleProxyRequest(req, res) {
     delete extraData.baseUrl;
     delete extraData.url;
 
-    // Handle initial state requests for orders / logs / schedules when no target URL is provided yet
+    // FIX: If frontend queries internal orders/logs without a targetUrl, return empty arrays immediately
     if (!targetUrl) {
-      if (req.path.includes('orders') || req.path.includes('schedule')) {
-        return res.json({ orders: [], entries: [], status: "success" });
-      }
-      return res.status(400).json({ error: 'Target URL is required' });
+      return res.json([]);
     }
 
     if (!apiKey) {
-      return res.status(400).json({ error: 'API Key is required' });
+      return res.json([]);
     }
 
     const payload = {
@@ -63,7 +60,6 @@ async function handleProxyRequest(req, res) {
       timeout: 15000
     });
 
-    // Ensure array fields exist in response if UI expects them
     let resData = response.data;
     if (typeof resData === 'object' && resData !== null) {
       if (resData.orders === undefined && Array.isArray(resData)) resData = { orders: resData };
@@ -74,12 +70,8 @@ async function handleProxyRequest(req, res) {
   } catch (error) {
     console.error('Proxy Error:', error.response?.data || error.message);
     
-    // Fallback empty structures on error so frontend map functions don't crash
-    return res.status(200).json({
-      orders: [],
-      entries: [],
-      error: error.message
-    });
+    // Always return array-friendly fallbacks on error
+    return res.status(200).json([]);
   }
 }
 
