@@ -219,24 +219,35 @@ async function executeScheduledLeg(order, leg) {
 }
 
 async function createSchedule(req, res) {
+  let name = 'Untitled schedule';
+  let defaultLink = '';
+  let submittedLegCount = 0;
+
   try {
     const body = req.body || {};
-    const name = String(body.name || 'Untitled schedule').trim().slice(0, 120);
-    const defaultLink = String(body.link || '').trim();
+    name = String(body.name || 'Untitled schedule').trim().slice(0, 120);
+    defaultLink = String(body.link || '').trim();
     const defaultBaseUrl = body.baseUrl ? safeUrl(body.baseUrl, 'Panel API URL') : '';
     const defaultApiKey = String(body.apiKey || body.key || '').trim();
     const inputLegs = body.legs;
+    submittedLegCount = Array.isArray(inputLegs) ? inputLegs.length : 0;
 
     if (!defaultLink) {
-      return res.status(400).json({ error: 'Target link is required' });
+      const error = new Error('Target link is required');
+      error.statusCode = 400;
+      throw error;
     }
     safeUrl(defaultLink, 'Target link');
 
     if (!Array.isArray(inputLegs) || inputLegs.length === 0) {
-      return res.status(400).json({ error: 'At least one scheduled service leg is required' });
+      const error = new Error('At least one scheduled service leg is required');
+      error.statusCode = 400;
+      throw error;
     }
     if (inputLegs.length > MAX_LEGS_PER_SCHEDULE) {
-      return res.status(400).json({ error: `A schedule can contain at most ${MAX_LEGS_PER_SCHEDULE} legs` });
+      const error = new Error(`A schedule can contain at most ${MAX_LEGS_PER_SCHEDULE} legs`);
+      error.statusCode = 400;
+      throw error;
     }
 
     const now = Date.now();
@@ -329,9 +340,27 @@ async function createSchedule(req, res) {
       order: publicOrder(order)
     });
   } catch (error) {
-    console.error('Schedule request error:', error.response?.data || error.message);
+    const body = req.body || {};
+    const secrets = [
+      body.apiKey,
+      body.key,
+      ...(Array.isArray(body.legs) ? body.legs.map((leg) => leg && (leg.apiKey || leg.key)) : [])
+    ].filter((value) => typeof value === 'string' && value.length > 0);
+    let safeError = String(error.message || 'Could not create schedule');
+    for (const secret of secrets) safeError = safeError.split(secret).join('[redacted]');
+
+    // Keep rejected attempts visible in server-backed Activity Logs, too.
+    // Never include keys or provider response payloads in this log entry.
+    addActivity({
+      type: 'schedule_rejected',
+      name,
+      link: defaultLink || null,
+      legCount: submittedLegCount,
+      error: safeError
+    });
+    console.error('Schedule request error:', safeError);
     return res.status(error.statusCode || error.response?.status || 500).json({
-      error: error.message || 'Could not create schedule'
+      error: safeError
     });
   }
 }
