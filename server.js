@@ -67,11 +67,15 @@ async function handleProxyRequest(req, res) {
 
     let resData = response.data;
 
-    // Normalize response for frontend maps
-    if (typeof resData === 'object' && resData !== null) {
-      if (resData.orders === undefined && Array.isArray(resData)) {
-        resData = { orders: resData };
-      }
+    // Preserve the standard SMM API response shape for services. The services
+    // action returns an array, and the frontend calls array methods such as
+    // .slice() on it. Wrapping it in { orders: [...] } causes "list.slice is
+    // not a function" when the frontend receives the result.
+    const isServicesAction =
+      typeof action === 'string' && action.toLowerCase() === 'services';
+
+    if (Array.isArray(resData) && !isServicesAction) {
+      resData = { orders: resData };
     }
 
     return res.json(resData);
