@@ -2,19 +2,15 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const qs = require('qs');
+const db = require('./db');
 
 const app = express();
+if (process.env.TEST_MODE === 'true') console.log('TEST_MODE enabled: provider order submissions blocked');
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-const scheduledOrders = new Map();
-const activityLog = [];
-const deliveredLog = [];
-const deliveryHistory = new Map();
-const legTimers = new Map();
-const MAX_LOG_ENTRIES = 2000;
 const MAX_LEGS_PER_SCHEDULE = 250;
 const MAX_SCHEDULE_DELAY_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_TIMEOUT_MS = 2147483647;
@@ -23,10 +19,7 @@ app.get('/', (req, res) => {
   res.send('Madara Proxy Server is Running');
 });
 
-function addActivity(entry) {
-  activityLog.unshift({ timestamp: Date.now(), ...entry });
-  if (activityLog.length > MAX_LOG_ENTRIES) activityLog.length = MAX_LOG_ENTRIES;
-}
+function addActivity(entry) { db.log(entry).catch(err => console.error('Activity log error:',err.message)); }
 
 function safeUrl(value, label) {
   try {
@@ -41,6 +34,14 @@ function safeUrl(value, label) {
 }
 
 async function postSmmApi(targetUrl, apiKey, params) {
+  if (process.env.TEST_MODE === 'true' && String(params?.action || '').toLowerCase() === 'add') {
+    const error = new Error('TEST_MODE: provider order submissions are disabled');
+    error.statusCode = 403;
+    throw error;
+  }
+  if (process.env.TEST_MODE === 'true') {
+    throw Object.assign(new Error('TEST_MODE: external provider requests disabled'), { statusCode: 403 });
+  }
   const parsedTarget = new URL(targetUrl);
   // Organic SMM's documented endpoint accepts JSON with a "key" field.
   // Keep form-encoded requests unchanged for standard SMM-panel APIs.
@@ -99,7 +100,7 @@ async function getProviderBalance(targetUrl, apiKey) {
 }
 
 function publicOrder(order) {
-  const doneLegs = order.legs.filter((leg) => ['completed', 'failed'].includes(leg.status)).length;
+  const doneLegs = order.legs.filter((leg) => ['completed', 'failed', 'uncertain'].includes(leg.status)).length;
   const byCategory = {};
   for (const leg of order.legs) {
     const category = leg.category || 'other';
@@ -123,99 +124,32 @@ function publicOrder(order) {
   };
 }
 
-function clearLegTimer(orderId, legId) {
-  const timerKey = `${orderId}:${legId}`;
-  const timer = legTimers.get(timerKey);
-  if (timer) clearTimeout(timer);
-  legTimers.delete(timerKey);
-}
-
-function armScheduledLeg(order, leg) {
-  if (order.status !== 'running' || leg.status !== 'waiting') return;
-  const timerKey = `${order.id}:${leg.id}`;
-  clearLegTimer(order.id, leg.id);
-  const remaining = Math.max(0, leg.dueAt - Date.now());
-
-  // JavaScript timers cannot safely represent a single delay longer than
-  // approximately 24.8 days, so re-arm long waits in bounded increments.
-  const delay = Math.min(remaining, MAX_TIMEOUT_MS);
-  const timer = setTimeout(() => {
-    legTimers.delete(timerKey);
-    if (order.status !== 'running' || leg.status !== 'waiting') return;
-    if (leg.dueAt > Date.now()) {
-      armScheduledLeg(order, leg);
-      return;
-    }
-    executeScheduledLeg(order, leg).catch((error) => {
-      console.error('Scheduled leg failure:', error.message);
-    });
-  }, delay);
-  legTimers.set(timerKey, timer);
-}
-
-async function executeScheduledLeg(order, leg) {
-  if (order.status !== 'running' || leg.status !== 'waiting') return;
-  leg.status = 'processing';
-
+let pollBusy = false;
+async function pollDueLegs() {
+  if (pollBusy) return;
+  pollBusy = true;
   try {
-    const data = await postSmmApi(leg.baseUrl, leg.apiKey, {
-      action: 'add',
-      service: leg.serviceId,
-      link: leg.link,
-      quantity: leg.quantity
-    });
-
-    const providerOrderId = data && data.order !== undefined ? String(data.order) : null;
-    leg.status = 'completed';
-    leg.providerOrderId = providerOrderId;
-    leg.finishedAt = Date.now();
-
-    const delivery = {
-      timestamp: leg.finishedAt,
-      link: leg.link,
-      category: leg.category || 'other',
-      amount: Number(leg.quantity),
-      serviceLabel: leg.serviceLabel || leg.category || 'Service',
-      orderId: order.id,
-      providerOrderId
-    };
-    deliveredLog.unshift(delivery);
-    if (deliveredLog.length > MAX_LOG_ENTRIES) deliveredLog.length = MAX_LOG_ENTRIES;
-
-    if (!deliveryHistory.has(leg.link)) deliveryHistory.set(leg.link, []);
-    deliveryHistory.get(leg.link).push(delivery);
-    const history = deliveryHistory.get(leg.link);
-    if (history.length > MAX_LOG_ENTRIES) history.splice(0, history.length - MAX_LOG_ENTRIES);
-
-    addActivity({
-      type: 'leg_completed',
-      orderId: order.id,
-      link: leg.link,
-      category: leg.category || 'other',
-      quantity: leg.quantity,
-      providerOrderId
-    });
-  } catch (error) {
-    leg.status = 'failed';
-    leg.error = error.response?.data?.error || error.message;
-    leg.finishedAt = Date.now();
-    order.lastError = leg.error;
-    addActivity({
-      type: 'leg_failed',
-      orderId: order.id,
-      link: leg.link,
-      category: leg.category || 'other',
-      quantity: leg.quantity,
-      error: leg.error
-    });
-  }
-
-  const remaining = order.legs.some((item) => ['waiting', 'processing'].includes(item.status));
-  if (!remaining) {
-    order.status = order.legs.some((item) => item.status === 'failed') ? 'failed' : 'completed';
-    order.finishedAt = Date.now();
-    addActivity({ type: 'schedule_finished', orderId: order.id, status: order.status });
-  }
+    // A database claim ensures only one worker processes each leg.
+    for(let i=0;i<10;i++) {
+      const leg=await db.claim();
+      if(!leg) break;
+      try {
+        const data=await postSmmApi(leg.baseUrl,leg.apiKey,{
+          action:'add',service:leg.serviceId,link:leg.link,quantity:leg.quantity
+        });
+        if(!data || data.order===undefined || data.order===null) {
+          await db.finish(leg,{status:'uncertain',error:'Provider response missing order ID; verify manually'});
+        } else {
+          await db.finish(leg,{status:'completed',providerOrderId:String(data.order)});
+        }
+      } catch(error) {
+        // Timeout/network failure may happen AFTER provider acceptance.
+        const uncertain=error.code==='ECONNABORTED'||!error.response;
+        await db.finish(leg,{status:uncertain?'uncertain':'failed',error:error.message});
+      }
+    }
+  } catch(e) { console.error('Scheduler poll failed:',e.message); }
+  finally { pollBusy=false; }
 }
 
 async function createSchedule(req, res) {
@@ -306,8 +240,10 @@ async function createSchedule(req, res) {
         providerAccounts.set(accountKey, { baseUrl: leg.baseUrl, apiKey: leg.apiKey });
       }
     }
-    for (const account of providerAccounts.values()) {
-      await getProviderBalance(account.baseUrl, account.apiKey);
+    if (process.env.TEST_MODE !== 'true') {
+      for (const account of providerAccounts.values()) {
+        await getProviderBalance(account.baseUrl, account.apiKey);
+      }
     }
 
     const id = `ord_${now}_${Math.random().toString(36).slice(2, 8)}`;
@@ -321,18 +257,7 @@ async function createSchedule(req, res) {
       lastError: null,
       legs
     };
-    scheduledOrders.set(id, order);
-    addActivity({
-      type: 'schedule_created',
-      orderId: id,
-      name,
-      link: defaultLink,
-      totalQuantity: legs.reduce((sum, leg) => sum + leg.quantity, 0),
-      legCount: legs.length
-    });
-
-    for (const leg of legs) armScheduledLeg(order, leg);
-
+    await db.create(order, { type:'schedule_created',orderId:id,name,link:defaultLink,totalQuantity:legs.reduce((sum,leg)=>sum+leg.quantity,0),legCount:legs.length });
     return res.status(201).json({
       ok: true,
       id,
@@ -365,48 +290,26 @@ async function createSchedule(req, res) {
   }
 }
 
-function listOrders(req, res) {
-  return res.json(Array.from(scheduledOrders.values())
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .map(publicOrder));
+async function listOrders(req,res) {
+  try { res.json((await db.list()).map(publicOrder)); }
+  catch(e) { res.status(500).json({error:'Could not load schedules'}); }
 }
-
-function orderAction(req, res) {
-  const order = scheduledOrders.get(String(req.params.id));
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-
-  if (req.params.action === 'pause') {
-    if (['completed', 'failed'].includes(order.status)) {
-      return res.status(409).json({ error: 'A finished order cannot be paused' });
-    }
-    order.status = 'paused';
-    for (const leg of order.legs) clearLegTimer(order.id, leg.id);
-    addActivity({ type: 'schedule_paused', orderId: order.id });
-    return res.json({ ok: true, order: publicOrder(order) });
-  }
-
-  if (req.params.action === 'resume') {
-    if (['completed', 'failed'].includes(order.status)) {
-      return res.status(409).json({ error: 'A finished order cannot be resumed' });
-    }
-    order.status = 'running';
-    for (const leg of order.legs) armScheduledLeg(order, leg);
-    addActivity({ type: 'schedule_resumed', orderId: order.id });
-    return res.json({ ok: true, order: publicOrder(order) });
-  }
-
-  return res.status(400).json({ error: 'Unsupported order action' });
+async function orderAction(req,res) {
+  try {
+    const id=String(req.params.id), action=req.params.action;
+    if(!['pause','resume'].includes(action)) return res.status(400).json({error:'Unsupported order action'});
+    const current=await db.get(id);
+    if(!current) return res.status(404).json({error:'Order not found'});
+    if(['completed','failed'].includes(current.status)) return res.status(409).json({error:'A finished order cannot be changed'});
+    await db.changeStatus(id,action);
+    return res.json({ok:true,order:publicOrder(await db.get(id))});
+  } catch(e) { return res.status(500).json({error:'Could not update schedule'}); }
 }
-
-function deleteOrder(req, res) {
-  const id = String(req.params.id);
-  const order = scheduledOrders.get(id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-
-  for (const leg of order.legs) clearLegTimer(order.id, leg.id);
-  scheduledOrders.delete(id);
-  addActivity({ type: 'schedule_deleted', orderId: id, name: order.name });
-  return res.json({ ok: true });
+async function deleteOrder(req,res) {
+  try {
+    const ok=await db.remove(String(req.params.id));
+    return ok?res.json({ok:true}):res.status(404).json({error:'Order not found'});
+  } catch(e) { return res.status(500).json({error:'Could not delete schedule'}); }
 }
 
 // Universal proxy for provider actions such as balance, services, status, and add.
@@ -439,8 +342,8 @@ async function handleProxyRequest(req, res) {
     timeoutMs = isOrganicEndpoint ? 30000 : 15000;
 
     const data = await postSmmApi(validatedTargetUrl, apiKey, {
-      ...(action ? { action } : {}),
-      ...extraData
+      ...extraData,
+      ...(action ? { action } : {})
     });
 
     const isServicesAction = typeof action === 'string' && action.toLowerCase() === 'services';
@@ -469,12 +372,9 @@ app.get('/orders', listOrders);
 app.delete('/orders/:id', deleteOrder);
 app.post('/orders/:id/:action', orderAction);
 
-app.get('/activity-log', (req, res) => res.json(activityLog));
-app.get('/delivered-log', (req, res) => res.json(deliveredLog));
-app.get('/history', (req, res) => {
-  const link = String(req.query.link || '');
-  return res.json((deliveryHistory.get(link) || []).slice());
-});
+app.get('/activity-log',async(req,res)=>{try{res.json(await db.activities())}catch(e){res.status(500).json({error:'Database unavailable'})}});
+app.get('/delivered-log',async(req,res)=>{try{res.json(await db.deliveries())}catch(e){res.status(500).json({error:'Database unavailable'})}});
+app.get('/history',async(req,res)=>{try{res.json(await db.deliveries(String(req.query.link||'')))}catch(e){res.status(500).json({error:'Database unavailable'})}});
 
 // Keep the provider proxy route distinct from schedule management routes.
 app.all('/proxy', handleProxyRequest);
@@ -484,6 +384,9 @@ app.all('/api', handleProxyRequest);
 app.all('*', handleProxyRequest);
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Madara Proxy running on port ${PORT}`);
-});
+db.init().then(async()=>{
+  await db.markInterrupted();
+  app.listen(PORT,'0.0.0.0',()=>console.log(`Madara Proxy running on port ${PORT}`));
+  setInterval(pollDueLegs,5000);
+  pollDueLegs();
+}).catch(e=>{console.error('Database initialization failed:',e.message);process.exit(1)});
