@@ -25,3 +25,10 @@ This branch has NOT been deployed or merged.
 - No tests have been executed against a live Supabase project. Test pause/resume, restart recovery, concurrent claims, provider timeout, invalid provider response, deletion and logs before merge.
 - No automatic replay of missed times during downtime is desirable without confirming the business policy. On wake, overdue waiting legs execute; review whether this is acceptable.
 - Keep exactly one deployment worker until the concurrency and failure recovery scenarios have been tested thoroughly.
+
+## Staging safety mode
+Set `TEST_MODE=true` **only on the separate Render test service**. This blocks provider `action=add` through both the scheduler and proxy. Never connect the test service to the production frontend. Remove test mode only after a reviewed deployment plan and explicit approval.
+
+The staging test service needs these environment variables: `DATABASE_URL`, `CREDENTIAL_ENCRYPTION_KEY`, and `TEST_MODE=true`.
+
+**Warning:** This is a development branch, not production-ready. Do not merge or deploy to the production service. Integration tests against a real Supabase database have not been run.
