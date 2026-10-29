@@ -32,3 +32,8 @@ Set `TEST_MODE=true` **only on the separate Render test service**. This blocks p
 The staging test service needs these environment variables: `DATABASE_URL`, `CREDENTIAL_ENCRYPTION_KEY`, and `TEST_MODE=true`.
 
 **Warning:** This is a development branch, not production-ready. Do not merge or deploy to the production service. Integration tests against a real Supabase database have not been run.
+
+## TLS certificate-chain error
+If Render logs `self-signed certificate in certificate chain`, download the trusted CA certificate from your Supabase project's database connection settings (verify it comes from Supabase). Set `DATABASE_CA_CERT` to the full PEM certificate including BEGIN/END lines in the **test service's** private environment settings. The backend accepts literal newlines or escaped `\\n` characters. Keep certificate verification enabled. Do not use a certificate obtained from an untrusted third party.
+
+Changes to this branch do not automatically repair a failed deployment; redeploy the staging service after setting its CA variable. Never share connection credentials or CA-related secrets in chat.
