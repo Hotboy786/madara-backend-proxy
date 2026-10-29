@@ -39,6 +39,9 @@ async function postSmmApi(targetUrl, apiKey, params) {
     error.statusCode = 403;
     throw error;
   }
+  if (process.env.TEST_MODE === 'true') {
+    throw Object.assign(new Error('TEST_MODE: external provider requests disabled'), { statusCode: 403 });
+  }
   const parsedTarget = new URL(targetUrl);
   // Organic SMM's documented endpoint accepts JSON with a "key" field.
   // Keep form-encoded requests unchanged for standard SMM-panel APIs.
@@ -237,8 +240,10 @@ async function createSchedule(req, res) {
         providerAccounts.set(accountKey, { baseUrl: leg.baseUrl, apiKey: leg.apiKey });
       }
     }
-    for (const account of providerAccounts.values()) {
-      await getProviderBalance(account.baseUrl, account.apiKey);
+    if (process.env.TEST_MODE !== 'true') {
+      for (const account of providerAccounts.values()) {
+        await getProviderBalance(account.baseUrl, account.apiKey);
+      }
     }
 
     const id = `ord_${now}_${Math.random().toString(36).slice(2, 8)}`;
@@ -337,8 +342,8 @@ async function handleProxyRequest(req, res) {
     timeoutMs = isOrganicEndpoint ? 30000 : 15000;
 
     const data = await postSmmApi(validatedTargetUrl, apiKey, {
-      ...(action ? { action } : {}),
-      ...extraData
+      ...extraData,
+      ...(action ? { action } : {})
     });
 
     const isServicesAction = typeof action === 'string' && action.toLowerCase() === 'services';
