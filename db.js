@@ -5,7 +5,13 @@ if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
 if (!process.env.CREDENTIAL_ENCRYPTION_KEY) throw new Error('CREDENTIAL_ENCRYPTION_KEY is required');
 const key = Buffer.from(process.env.CREDENTIAL_ENCRYPTION_KEY, 'hex');
 if (key.length !== 32) throw new Error('CREDENTIAL_ENCRYPTION_KEY must be 32 bytes in hex (64 characters)');
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5, ssl: { rejectUnauthorized: true } });
+// Supabase's IPv4 session pooler may present a certificate chain signed by a
+// provider-specific CA. Keep verification enabled and support an explicit CA.
+// Do not use rejectUnauthorized:false or NODE_TLS_REJECT_UNAUTHORIZED=0.
+const connectionString = process.env.DATABASE_URL;
+const ca = process.env.DATABASE_CA_CERT;
+const ssl = ca ? { rejectUnauthorized: true, ca: ca.replace(/\\n/g, '\n') } : { rejectUnauthorized: true };
+const pool = new Pool({ connectionString, max: 5, ssl });
 function encrypt(value) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
