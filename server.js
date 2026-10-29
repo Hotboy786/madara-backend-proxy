@@ -5,6 +5,7 @@ const qs = require('qs');
 const db = require('./db');
 
 const app = express();
+if (process.env.TEST_MODE === 'true') console.log('TEST_MODE enabled: provider order submissions blocked');
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
@@ -33,6 +34,11 @@ function safeUrl(value, label) {
 }
 
 async function postSmmApi(targetUrl, apiKey, params) {
+  if (process.env.TEST_MODE === 'true' && String(params?.action || '').toLowerCase() === 'add') {
+    const error = new Error('TEST_MODE: provider order submissions are disabled');
+    error.statusCode = 403;
+    throw error;
+  }
   const parsedTarget = new URL(targetUrl);
   // Organic SMM's documented endpoint accepts JSON with a "key" field.
   // Keep form-encoded requests unchanged for standard SMM-panel APIs.
