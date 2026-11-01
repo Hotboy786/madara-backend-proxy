@@ -431,7 +431,7 @@ app.get('/diagnostics/kmpanel-post', async (req, res) => {
       ? payload
       : (payload && typeof payload === 'object' ? (payload.error || payload.message || '') : '');
     const safeMessage = typeof rawMessage === 'string'
-      ? rawMessage.replace(/https?:\\/\\/\\S+/gi, '[url]').replace(/[A-Za-z0-9_-]{32,}/g, '[redacted]').slice(0, 200)
+      ? rawMessage.replace(/https?:\/\/\S+/gi, '[url]').replace(/[A-Za-z0-9_-]{32,}/g, '[redacted]').slice(0, 200)
       : '';
     return res.json({
       endpoint,
