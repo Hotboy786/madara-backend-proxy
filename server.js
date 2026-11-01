@@ -408,6 +408,43 @@ app.get('/diagnostics/kmpanel', async (req, res) => {
   }
 });
 
+// Credential-free POST probe for KM Panel's former proxy route.
+// Fixed endpoint; no user-controlled target, API key, or order action.
+app.get('/diagnostics/kmpanel-post', async (req, res) => {
+  const endpoint = 'https://kmpanel.onrender.com/proxy';
+  const started = Date.now();
+  try {
+    const response = await axios.post(endpoint, {}, {
+      timeout: 8000,
+      maxRedirects: 0,
+      validateStatus: () => true,
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Madara-Panel-Diagnostic/1.0'
+      }
+    });
+    const location = response.headers.location;
+    return res.json({
+      endpoint,
+      method: 'POST',
+      reachable: true,
+      status: response.status,
+      elapsedMs: Date.now() - started,
+      redirectLocation: response.status >= 300 && response.status < 400 ? (location || null) : null,
+      note: 'Empty POST only. No credentials or order instructions sent. A 404 does not prove the entire service is offline.'
+    });
+  } catch (error) {
+    return res.json({
+      endpoint,
+      method: 'POST',
+      reachable: false,
+      elapsedMs: Date.now() - started,
+      errorCode: error.code || 'NETWORK_ERROR',
+      note: 'Network failure does not identify a replacement hosting URL.'
+    });
+  }
+});
+
 // Keep the provider proxy route distinct from schedule management routes.
 app.all('/proxy', handleProxyRequest);
 app.all('/status', handleProxyRequest);
