@@ -424,11 +424,23 @@ app.get('/diagnostics/kmpanel-post', async (req, res) => {
       }
     });
     const location = response.headers.location;
+    // Only expose a short, plain-text error message and non-sensitive headers.
+    // Never return raw upstream bodies, cookies, tokens, or request details.
+    const payload = response.data;
+    const rawMessage = typeof payload === 'string'
+      ? payload
+      : (payload && typeof payload === 'object' ? (payload.error || payload.message || '') : '');
+    const safeMessage = typeof rawMessage === 'string'
+      ? rawMessage.replace(/https?:\/\/\S+/gi, '[url]').replace(/[A-Za-z0-9_-]{32,}/g, '[redacted]').slice(0, 200)
+      : '';
     return res.json({
       endpoint,
       method: 'POST',
       reachable: true,
       status: response.status,
+      contentType: String(response.headers['content-type'] || '').slice(0, 100),
+      serverHeader: String(response.headers.server || '').slice(0, 80),
+      errorMessage: safeMessage || null,
       elapsedMs: Date.now() - started,
       redirectLocation: response.status >= 300 && response.status < 400 ? (location || null) : null,
       note: 'Empty POST only. No credentials or order instructions sent. A 404 does not prove the entire service is offline.'
