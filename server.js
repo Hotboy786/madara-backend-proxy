@@ -376,6 +376,38 @@ app.get('/activity-log',async(req,res)=>{try{res.json(await db.activities())}cat
 app.get('/delivered-log',async(req,res)=>{try{res.json(await db.deliveries())}catch(e){res.status(500).json({error:'Database unavailable'})}});
 app.get('/history',async(req,res)=>{try{res.json(await db.deliveries(String(req.query.link||'')))}catch(e){res.status(500).json({error:'Database unavailable'})}});
 
+// Read-only diagnostic for the retired KM Panel endpoint. Fixed target only;
+// never forwards user credentials, request bodies, or provider API keys.
+app.get('/diagnostics/kmpanel', async (req, res) => {
+  const endpoint = 'https://kmpanel.onrender.com/proxy';
+  const started = Date.now();
+  try {
+    const response = await axios.get(endpoint, {
+      timeout: 8000,
+      maxRedirects: 0,
+      validateStatus: () => true,
+      headers: { 'User-Agent': 'Madara-Panel-Diagnostic/1.0' }
+    });
+    const location = response.headers.location;
+    return res.json({
+      endpoint,
+      reachable: true,
+      status: response.status,
+      elapsedMs: Date.now() - started,
+      redirectLocation: response.status >= 300 && response.status < 400 ? (location || null) : null,
+      note: 'GET availability only; the /proxy API may require POST. No API key was sent.'
+    });
+  } catch (error) {
+    return res.json({
+      endpoint,
+      reachable: false,
+      elapsedMs: Date.now() - started,
+      errorCode: error.code || 'NETWORK_ERROR',
+      note: 'A failed GET does not establish whether the service moved or was deleted.'
+    });
+  }
+});
+
 // Keep the provider proxy route distinct from schedule management routes.
 app.all('/proxy', handleProxyRequest);
 app.all('/status', handleProxyRequest);
