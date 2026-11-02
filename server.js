@@ -43,21 +43,49 @@ async function postSmmApi(targetUrl, apiKey, params) {
     throw Object.assign(new Error('TEST_MODE: external provider requests disabled'), { statusCode: 403 });
   }
   const parsedTarget = new URL(targetUrl);
-  // Organic SMM's documented endpoint accepts JSON with a "key" field.
-  // Keep form-encoded requests unchanged for standard SMM-panel APIs.
-  const usesOrganicJsonApi = /\/functions\/v1\/public-api\/?$/i.test(parsedTarget.pathname);
+  // Organic SMM uses a custom endpoint. Start with its documented JSON format.
+  // If a read-only action times out, try form encoding as a safe compatibility fallback.
+  // Never retry "add" automatically because a timed-out order may already have been accepted.
+  const usesOrganicEndpoint = /\/functions\/v1\/public-api\/?$/i.test(parsedTarget.pathname);
   const requestData = { key: apiKey, ...params };
-  const response = await axios({
-    method: 'POST',
-    url: targetUrl,
-    data: usesOrganicJsonApi ? requestData : qs.stringify(requestData),
-    headers: {
-      'Content-Type': usesOrganicJsonApi ? 'application/json' : 'application/x-www-form-urlencoded',
-      'User-Agent': 'Madara-Panel-Proxy/1.0'
-    },
-    // Organic SMM previously timed out at the proxy's 15-second limit.
-    timeout: usesOrganicJsonApi ? 30000 : 15000
-  });
+  const action = String(params.action || '').toLowerCase();
+  const canFallbackEncoding = usesOrganicEndpoint && ['balance', 'services', 'status'].includes(action);
+  const jsonTimeoutMs = canFallbackEncoding ? 12000 : 30000;
+
+  let response;
+  try {
+    response = await axios({
+      method: 'POST',
+      url: targetUrl,
+      data: usesOrganicEndpoint ? requestData : qs.stringify(requestData),
+      headers: {
+        'Content-Type': usesOrganicEndpoint ? 'application/json' : 'application/x-www-form-urlencoded',
+        'User-Agent': 'Madara-Panel-Proxy/1.0'
+      },
+      timeout: usesOrganicEndpoint ? jsonTimeoutMs : 15000
+    });
+  } catch (error) {
+    const isTimeout = error.code === 'ECONNABORTED' || /timeout of \d+ms exceeded/i.test(error.message || '');
+    if (!canFallbackEncoding || !isTimeout) throw error;
+
+    console.warn(`Organic SMM ${action} JSON request timed out; retrying once as form-urlencoded (read-only action)`);
+    try {
+      response = await axios({
+        method: 'POST',
+        url: targetUrl,
+        data: qs.stringify(requestData),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'Madara-Panel-Proxy/1.0'
+        },
+        timeout: 15000
+      });
+    } catch (fallbackError) {
+      const fallbackTimedOut = fallbackError.code === 'ECONNABORTED' || /timeout of \d+ms exceeded/i.test(fallbackError.message || '');
+      if (fallbackTimedOut) fallbackError.totalTimeoutMs = jsonTimeoutMs + 15000;
+      throw fallbackError;
+    }
+  }
 
   const data = response.data;
   const providerStatus = data && typeof data.status === 'string' ? data.status.toLowerCase() : '';
@@ -350,18 +378,19 @@ async function handleProxyRequest(req, res) {
     if (Array.isArray(data) && !isServicesAction) return res.json({ orders: data });
     return res.json(data);
   } catch (error) {
-    const isTimeout = error.code === 'ECONNABORTED' || /timeout of \d+ms exceeded/i.test(error.message || '');
+    const isTimeout = error.code === 'ECONNABORTED' || Number(error.totalTimeoutMs) > 0 || /timeout of \d+ms exceeded/i.test(error.message || '');
+    const reportedTimeoutMs = Number(error.totalTimeoutMs) > 0 ? Number(error.totalTimeoutMs) : timeoutMs;
     const errorMessage = isTimeout
-      ? `Provider API did not respond within ${timeoutMs}ms`
+      ? `Provider API did not respond within ${reportedTimeoutMs}ms`
       : (error.message || 'Proxy request failed');
 
-    console.error('Proxy Error:', isTimeout ? `Upstream timeout during action ${action || 'unknown'} (${provider})` : (error.response?.data || error.message));
+    console.error('Proxy Error:', isTimeout ? `Upstream timeout during action ${action || 'unknown'} (${provider}, ${reportedTimeoutMs}ms)` : (error.response?.data || error.message));
     return res.status(error.statusCode || error.response?.status || (isTimeout ? 504 : 500)).json({
       error: errorMessage,
       code: isTimeout ? 'UPSTREAM_TIMEOUT' : (error.code || 'PROXY_ERROR'),
       action,
       provider,
-      timeoutMs,
+      timeoutMs: reportedTimeoutMs,
       details: isTimeout ? null : (error.response?.data || null)
     });
   }
