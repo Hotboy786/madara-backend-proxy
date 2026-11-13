@@ -37,6 +37,10 @@ async function init() {
     status text NOT NULL, provider_order_id text, error text, finished_at bigint,
     PRIMARY KEY(schedule_id,id)
   )`);
+  await pool.query('ALTER TABLE schedules ADD COLUMN IF NOT EXISTS policy_version integer NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE schedule_legs ADD COLUMN IF NOT EXISTS submitted_at bigint');
+  await pool.query('ALTER TABLE schedule_legs ADD COLUMN IF NOT EXISTS next_poll_at bigint');
+  await pool.query('ALTER TABLE schedule_legs ADD COLUMN IF NOT EXISTS provider_status text');
   await pool.query('CREATE INDEX IF NOT EXISTS schedule_legs_due_idx ON schedule_legs(status,due_at)');
   await pool.query(`CREATE TABLE IF NOT EXISTS activity_entries (
     id bigserial PRIMARY KEY, timestamp bigint NOT NULL, payload jsonb NOT NULL
@@ -49,8 +53,8 @@ async function create(order, activity) {
   const c = await pool.connect();
   try {
     await c.query('BEGIN');
-    await c.query('INSERT INTO schedules VALUES ($1,$2,$3,$4,$5,$6,$7)',
-      [order.id,order.name,order.link,order.status,order.createdAt,null,null]);
+    await c.query('INSERT INTO schedules (id,name,link,status,created_at,finished_at,last_error,policy_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+      [order.id,order.name,order.link,order.status,order.createdAt,null,null,order.policyVersion||0]);
     for (const l of order.legs) {
       await c.query(`INSERT INTO schedule_legs
         (schedule_id,id,service_id,link,quantity,category,service_label,base_url,encrypted_api_key,due_at,status)
@@ -58,6 +62,12 @@ async function create(order, activity) {
         [order.id,l.id,l.serviceId,l.link,l.quantity,l.category,l.serviceLabel,l.baseUrl,encrypt(l.apiKey),l.dueAt]);
     }
     await c.query('INSERT INTO activity_entries(timestamp,payload) VALUES($1,$2)',[Date.now(),activity]);
+    for (const l of order.legs) {
+      await c.query('INSERT INTO activity_entries(timestamp,payload) VALUES($1,$2)', [Date.now(), {
+        type:'leg_planned', orderId:order.id, legId:l.id, quantity:l.quantity,
+        category:l.category, scheduledAt:l.dueAt, status:'waiting'
+      }]);
+    }
     await c.query('COMMIT');
   } catch(e) { await c.query('ROLLBACK'); throw e; } finally { c.release(); }
 }
@@ -67,12 +77,13 @@ function fromRows(rows) {
     if(!orders.has(r.schedule_id)) orders.set(r.schedule_id,{
       id:r.schedule_id,name:r.name,link:r.schedule_link,status:r.schedule_status,
       createdAt:Number(r.created_at),finishedAt:r.schedule_finished_at?Number(r.schedule_finished_at):null,
-      lastError:r.last_error,legs:[]
+      lastError:r.last_error,policyVersion:r.policy_version||0,legs:[]
     });
     if(r.id!==null) orders.get(r.schedule_id).legs.push({
       id:r.id,serviceId:r.service_id,link:r.link,quantity:r.quantity,
       category:r.category,serviceLabel:r.service_label,baseUrl:r.base_url,
       dueAt:Number(r.due_at),status:r.status,providerOrderId:r.provider_order_id,
+      submittedAt:r.submitted_at?Number(r.submitted_at):null,providerStatus:r.provider_status,
       error:r.error,finishedAt:r.finished_at?Number(r.finished_at):null
     });
   }
@@ -80,7 +91,7 @@ function fromRows(rows) {
 }
 async function list() {
   const {rows}=await pool.query(`SELECT s.id AS schedule_id,s.name,s.link AS schedule_link,
-    s.status AS schedule_status,s.created_at,s.finished_at AS schedule_finished_at,s.last_error,
+    s.status AS schedule_status,s.policy_version,s.created_at,s.finished_at AS schedule_finished_at,s.last_error,
     l.* FROM schedules s LEFT JOIN schedule_legs l ON l.schedule_id=s.id
     ORDER BY s.created_at DESC,l.id ASC`);
   return fromRows(rows);
@@ -90,15 +101,17 @@ async function claim() {
   const c=await pool.connect();
   try {
     await c.query('BEGIN');
-    const {rows}=await c.query(`SELECT l.* FROM schedule_legs l JOIN schedules s ON s.id=l.schedule_id
+    const {rows}=await c.query(`SELECT l.*,s.policy_version FROM schedule_legs l JOIN schedules s ON s.id=l.schedule_id
       WHERE l.status='waiting' AND s.status='running' AND l.due_at <= $1
-      ORDER BY l.due_at LIMIT 1 FOR UPDATE OF l SKIP LOCKED`,[Date.now()]);
+      AND (s.policy_version < 2 OR NOT EXISTS (SELECT 1 FROM schedule_legs previous
+        WHERE previous.schedule_id=l.schedule_id AND previous.id<l.id AND previous.status<>'completed'))
+      ORDER BY l.due_at,l.id LIMIT 1 FOR UPDATE OF l SKIP LOCKED`,[Date.now()]);
     if(!rows.length) { await c.query('COMMIT'); return null; }
     const r=rows[0];
     await c.query("UPDATE schedule_legs SET status='processing' WHERE schedule_id=$1 AND id=$2",[r.schedule_id,r.id]);
     await c.query('COMMIT');
-    return {orderId:r.schedule_id,id:r.id,serviceId:r.service_id,link:r.link,quantity:r.quantity,
-      category:r.category,serviceLabel:r.service_label,baseUrl:r.base_url,apiKey:decrypt(r.encrypted_api_key)};
+    return {orderId:r.schedule_id,policyVersion:r.policy_version||0,id:r.id,serviceId:r.service_id,link:r.link,quantity:r.quantity,
+      category:r.category,serviceLabel:r.service_label,dueAt:Number(r.due_at),baseUrl:r.base_url,apiKey:decrypt(r.encrypted_api_key)};
   } catch(e) { await c.query('ROLLBACK'); throw e; } finally { c.release(); }
 }
 async function finish(leg, result) {
@@ -106,11 +119,11 @@ async function finish(leg, result) {
   try {
     await c.query('BEGIN');
     await c.query(`UPDATE schedule_legs SET status=$3,provider_order_id=$4,error=$5,finished_at=$6
-      WHERE schedule_id=$1 AND id=$2 AND status='processing'`,
+      WHERE schedule_id=$1 AND id=$2 AND status IN ('processing','submitted')`,
       [leg.orderId,leg.id,result.status,result.providerOrderId||null,result.error||null,Date.now()]);
-    if(result.error) await c.query('UPDATE schedules SET last_error=$2 WHERE id=$1',[leg.orderId,result.error]);
+    if(result.error) await c.query("UPDATE schedules SET last_error=$2,status=CASE WHEN policy_version>=2 THEN 'paused' ELSE status END WHERE id=$1",[leg.orderId,result.error]);
     const activity={type:result.status==='completed'?'leg_completed':'leg_failed',orderId:leg.orderId,
-      link:leg.link,category:leg.category,quantity:leg.quantity,
+      link:leg.link,category:leg.category,quantity:leg.quantity,legId:leg.id,scheduledAt:leg.dueAt,
       ...(result.providerOrderId?{providerOrderId:result.providerOrderId}:{}),
       ...(result.error?{error:result.error}:{})};
     await c.query('INSERT INTO activity_entries(timestamp,payload) VALUES($1,$2)',[Date.now(),activity]);
@@ -122,7 +135,7 @@ async function finish(leg, result) {
     const pending=await c.query(`SELECT COUNT(*)::int AS count,
       COUNT(*) FILTER (WHERE status IN ('failed','uncertain'))::int AS failed
       FROM schedule_legs WHERE schedule_id=$1`,[leg.orderId]);
-    const totals=await c.query('SELECT COUNT(*)::int AS count FROM schedule_legs WHERE schedule_id=$1 AND status IN (\'waiting\',\'processing\')',[leg.orderId]);
+    const totals=await c.query('SELECT COUNT(*)::int AS count FROM schedule_legs WHERE schedule_id=$1 AND status IN (\'waiting\',\'processing\',\'submitted\')',[leg.orderId]);
     if(totals.rows[0].count===0) {
       const status=pending.rows[0].failed?'failed':'completed';
       await c.query('UPDATE schedules SET status=$2,finished_at=$3 WHERE id=$1',[leg.orderId,status,Date.now()]);
@@ -156,7 +169,44 @@ async function markInterrupted() {
   const {rows}=await pool.query(`UPDATE schedule_legs SET status='uncertain',
     error='Backend interrupted during submission; verify provider history before retrying'
     WHERE status='processing' RETURNING schedule_id,id`);
-  for(const r of rows) await log({type:'leg_failed',orderId:r.schedule_id,
-    error:'Submission outcome unknown after restart; check provider history'});
+  for(const r of rows) {
+    await pool.query("UPDATE schedules SET status='paused',last_error=$2 WHERE id=$1 AND policy_version>=2",
+      [r.schedule_id,'Submission outcome unknown after restart; check provider history']);
+    await log({type:'leg_failed',orderId:r.schedule_id,legId:r.id,
+      error:'Submission outcome unknown after restart; remaining legs blocked'});
+  }
 }
-module.exports={init,create,list,get,claim,finish,changeStatus,remove,log,activities,deliveries,markInterrupted,pool};
+
+async function submitted(leg, providerOrderId) {
+  const now=Date.now();
+  await pool.query(`UPDATE schedule_legs SET status='submitted',provider_order_id=$3,
+    submitted_at=$4,next_poll_at=$4,provider_status='Pending'
+    WHERE schedule_id=$1 AND id=$2 AND status='processing'`,
+    [leg.orderId,leg.id,providerOrderId,now]);
+  await log({type:'leg_submitted',orderId:leg.orderId,legId:leg.id,
+    quantity:leg.quantity,category:leg.category,scheduledAt:leg.dueAt,
+    requestedAt:now,providerOrderId});
+}
+async function claimStatusCheck() {
+  const {rows}=await pool.query(`UPDATE schedule_legs SET next_poll_at=$1
+    WHERE (schedule_id,id) IN (
+      SELECT schedule_id,id FROM schedule_legs WHERE status='submitted'
+      AND COALESCE(next_poll_at,0)<=$2 ORDER BY next_poll_at
+      LIMIT 1 FOR UPDATE SKIP LOCKED
+    ) RETURNING *`,[Date.now()+60000,Date.now()]);
+  if(!rows.length) return null;
+  const r=rows[0];
+  return {orderId:r.schedule_id,id:r.id,providerOrderId:r.provider_order_id,
+    serviceId:r.service_id,link:r.link,quantity:r.quantity,category:r.category,
+    serviceLabel:r.service_label,dueAt:Number(r.due_at),
+    providerStatus:r.provider_status,baseUrl:r.base_url,apiKey:decrypt(r.encrypted_api_key)};
+}
+async function updateProviderStatus(leg,status) {
+  await pool.query('UPDATE schedule_legs SET provider_status=$3 WHERE schedule_id=$1 AND id=$2',
+    [leg.orderId,leg.id,status]);
+  if(status!==leg.providerStatus) await log({type:'leg_status',orderId:leg.orderId,
+    legId:leg.id,quantity:leg.quantity,category:leg.category,providerStatus:status,
+    providerOrderId:leg.providerOrderId});
+}
+
+module.exports={submitted,claimStatusCheck,updateProviderStatus,init,create,list,get,claim,finish,changeStatus,remove,log,activities,deliveries,markInterrupted,pool};
