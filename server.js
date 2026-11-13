@@ -11,7 +11,7 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-const MAX_LEGS_PER_SCHEDULE = 250;
+const MAX_LEGS_PER_SCHEDULE = 2000;
 const MAX_SCHEDULE_DELAY_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_TIMEOUT_MS = 2147483647;
 
@@ -120,7 +120,10 @@ function publicOrder(order) {
     byCategory,
     nextFireAt: nextLeg ? new Date(nextLeg.dueAt).toISOString() : null,
     lastError: order.lastError || null,
-    createdAt: order.createdAt
+    createdAt: order.createdAt,
+    legs: order.legs.map(l => ({ id:l.id, quantity:l.quantity, category:l.category,
+      scheduledAt:l.dueAt, requestedAt:l.submittedAt, completedAt:l.finishedAt,
+      status:l.status, providerStatus:l.providerStatus, providerOrderId:l.providerOrderId, error:l.error }))
   };
 }
 
@@ -129,6 +132,28 @@ async function pollDueLegs() {
   if (pollBusy) return;
   pollBusy = true;
   try {
+    // Poll accepted orders; acceptance is not successful delivery.
+    for(let i=0;i<10;i++) {
+      const leg=await db.claimStatusCheck();
+      if(!leg) break;
+      try {
+        const response=await postSmmApi(leg.baseUrl,leg.apiKey,{action:'status',order:leg.providerOrderId});
+        const raw=response?.status ?? response?.data?.status;
+        const status=String(raw || '').trim();
+        await db.updateProviderStatus(leg,status || 'Unknown');
+        const normalized=status.toLowerCase().replace(/[ _-]/g,'');
+        if(normalized==='completed') {
+          await db.finish(leg,{status:'completed',providerOrderId:leg.providerOrderId});
+        } else if(['partial','canceled','cancelled','failed','refunded'].includes(normalized)) {
+          await db.finish(leg,{status:'failed',providerOrderId:leg.providerOrderId,
+            error:'Provider returned '+status+'; remaining legs blocked'});
+        }
+      } catch(error) {
+        // Read-only status failures never resubmit the paid order or release the next leg.
+        await db.log({type:'leg_status_error',orderId:leg.orderId,legId:leg.id,
+          quantity:leg.quantity,category:leg.category,error:'Status check failed; retrying in 60 seconds'});
+      }
+    }
     // A database claim ensures only one worker processes each leg.
     for(let i=0;i<10;i++) {
       const leg=await db.claim();
@@ -140,7 +165,7 @@ async function pollDueLegs() {
         if(!data || data.order===undefined || data.order===null) {
           await db.finish(leg,{status:'uncertain',error:'Provider response missing order ID; verify manually'});
         } else {
-          await db.finish(leg,{status:'completed',providerOrderId:String(data.order)});
+          await db.submitted(leg,String(data.order));
         }
       } catch(error) {
         // Timeout/network failure may happen AFTER provider acceptance.
