@@ -11,11 +11,11 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-const MAX_LEGS_PER_SCHEDULE = 2000;
+const MAX_LEGS_PER_SCHEDULE = 250;
 const MAX_SCHEDULE_DELAY_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_TIMEOUT_MS = 2147483647;
 
-app.get('/health', (req,res)=>res.json({ok:true,version:'sequential-legs-v2'}));
+app.get('/health', (req,res)=>res.json({ok:true,version:'original-leg-scheduler-restored'}));
 app.get('/', (req, res) => {
   res.send('Madara Proxy Server is Running');
 });
@@ -121,11 +121,7 @@ function publicOrder(order) {
     byCategory,
     nextFireAt: nextLeg ? new Date(nextLeg.dueAt).toISOString() : null,
     lastError: order.lastError || null,
-    createdAt: order.createdAt,
-    policyVersion:order.policyVersion||0,
-    legs: order.legs.map(l => ({ id:l.id, quantity:l.quantity, category:l.category,
-      scheduledAt:l.dueAt, requestedAt:l.submittedAt, completedAt:l.finishedAt,
-      status:l.status, providerStatus:l.providerStatus, providerOrderId:l.providerOrderId, error:l.error }))
+    createdAt: order.createdAt
   };
 }
 
@@ -167,8 +163,7 @@ async function pollDueLegs() {
         if(!data || data.order===undefined || data.order===null) {
           await db.finish(leg,{status:'uncertain',error:'Provider response missing order ID; verify manually'});
         } else {
-          if(leg.policyVersion>=2) await db.submitted(leg,String(data.order));
-          else await db.finish(leg,{status:'completed',providerOrderId:String(data.order)});
+          await db.finish(leg,{status:'completed',providerOrderId:String(data.order)});
         }
       } catch(error) {
         // Timeout/network failure may happen AFTER provider acceptance.
@@ -280,7 +275,6 @@ async function createSchedule(req, res) {
       name,
       link: defaultLink,
       status: 'running',
-      policyVersion:body.policyVersion===2?2:0,
       createdAt: now,
       finishedAt: null,
       lastError: null,
